@@ -86,6 +86,20 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # SWA (Stochastic Weight Averaging) during warmdown.
+    use_swa: bool = bool(int(os.environ.get("USE_SWA", "0")))
+    swa_every_n_steps: int = int(os.environ.get("SWA_EVERY_N_STEPS", 10))
+
+    # QAT (Quantization-Aware Training) during warmdown.
+    qat_enabled: bool = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_use_amax: bool = bool(int(os.environ.get("QAT_USE_AMAX", "0")))
+
+    # Weight decay for Adam-optimized parameters (not Muon).
+    weight_decay: float = float(os.environ.get("WEIGHT_DECAY", 0.0))
+
+    # Eval-time sequence length (0 = same as train_seq_len).
+    eval_seq_len: int = int(os.environ.get("EVAL_SEQ_LEN", 0))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -231,15 +245,16 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    eval_sl = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < eval_sl:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, eval_seq_len={eval_sl}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // eval_sl
+    total_seqs = (val_tokens.numel() - 1) // eval_sl
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -250,11 +265,11 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * eval_sl
+            raw_end = batch_seq_end * eval_sl + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            x = local[:-1].reshape(-1, eval_sl)
+            y = local[1:].reshape(-1, eval_sl)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -338,6 +353,27 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+def fake_quantize_per_row(w: Tensor, use_amax: bool = False) -> Tensor:
+    """Straight-through estimator fake quantization matching quantize_float_tensor().
+
+    Used during QAT to simulate int8 quantization in the forward pass so the
+    model learns to be robust to quantization noise.
+    """
+    with torch.no_grad():
+        t32 = w.float()
+        if use_amax:
+            clip_abs = t32.abs().amax(dim=1)
+        else:
+            clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.zeros(t32.shape[0])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        # Round scale to float16 then back, matching actual quantize_float_tensor() pipeline.
+        scale = scale.to(torch.float16).to(torch.float32)
+        clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
+        w_q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127)
+        w_deq = (w_q * scale[:, None]).to(w.dtype)
+    return w + (w_deq - w).detach()
+
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -508,9 +544,15 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _qat_active: bool = False  # Class-level flag toggled from the training loop.
+    _qat_use_amax: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if CastedLinear._qat_active and w.ndim == 2 and w.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+            w = fake_quantize_per_row(w, use_amax=CastedLinear._qat_use_amax)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -811,7 +853,8 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    eval_sl = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    val_tokens = load_validation_tokens(args.val_files, max(args.train_seq_len, eval_sl))
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -840,6 +883,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Guard on CastedLinear._qat_active so torch.compile recompiles when QAT toggles.
+    torch._dynamo.config.guard_nn_modules = True
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -867,6 +912,7 @@ def main() -> None:
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=args.weight_decay,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -881,6 +927,7 @@ def main() -> None:
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        weight_decay=args.weight_decay,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
@@ -889,6 +936,7 @@ def main() -> None:
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
+            weight_decay=args.weight_decay,
         )
         optimizers.insert(1, optimizer_head)
 
@@ -908,6 +956,17 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"use_swa:{args.use_swa} swa_every_n_steps:{args.swa_every_n_steps}")
+    log0(f"qat_enabled:{args.qat_enabled} qat_use_amax:{args.qat_use_amax}")
+    log0(f"weight_decay:{args.weight_decay}")
+    log0(f"eval_seq_len:{args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len}")
+
+    # Set QAT amax fallback flag on the class.
+    CastedLinear._qat_use_amax = args.qat_use_amax
+
+    # SWA state — accumulates model weights during warmdown.
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1006,6 +1065,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        in_warmdown = scale < 1.0
+
+        # Toggle QAT fake quantization during warmdown.
+        CastedLinear._qat_active = args.qat_enabled and in_warmdown
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1033,6 +1097,16 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # SWA: accumulate model weights during warmdown.
+        if args.use_swa and in_warmdown and step % args.swa_every_n_steps == 0:
+            sd = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+            if swa_state is None:
+                swa_state = sd
+            else:
+                for k in swa_state:
+                    swa_state[k] += sd[k]
+            swa_count += 1
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1058,6 +1132,21 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Disable QAT for eval.
+    CastedLinear._qat_active = False
+
+    # Load SWA-averaged weights if available.
+    if swa_state is not None and swa_count > 0:
+        avg = {k: (v / swa_count).to(device) for k, v in swa_state.items()}
+        base_model.load_state_dict(avg, strict=True)
+        log0(f"swa: loaded averaged weights from {swa_count} checkpoints")
+        # Re-run pre-quant validation with SWA weights.
+        swa_val_loss, swa_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        log0(f"swa_pre_quant val_loss:{swa_val_loss:.4f} val_bpb:{swa_val_bpb:.4f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
