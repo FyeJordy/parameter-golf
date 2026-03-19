@@ -94,6 +94,13 @@ class Hyperparameters:
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # SWA (Stochastic Weight Averaging) during warmdown.
+    use_swa: bool = bool(int(os.environ.get("USE_SWA", "0")))
+    swa_every_n_steps: int = int(os.environ.get("SWA_EVERY_N_STEPS", 10))
+
+    # Weight decay for Adam-optimized parameters (not Muon).
+    weight_decay: float = float(os.environ.get("WEIGHT_DECAY", 0.0))
+
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
     @property
@@ -998,6 +1005,8 @@ def main() -> None:
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
+    swa_state: dict[str, mx.array] | None = None
+    swa_count = 0
     t0 = time.perf_counter()
     step = 0
     while True:
@@ -1044,6 +1053,17 @@ def main() -> None:
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
+        # SWA: accumulate model weights during warmdown.
+        in_warmdown = lr_mul < 1.0
+        if args.use_swa and in_warmdown and step % args.swa_every_n_steps == 0:
+            sd = {k: mx.array(v) for k, v in tree_flatten(model.state)}
+            if swa_state is None:
+                swa_state = sd
+            else:
+                for k in swa_state:
+                    swa_state[k] = swa_state[k] + sd[k]
+            swa_count += 1
+
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
@@ -1055,6 +1075,12 @@ def main() -> None:
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
+
+    # Load SWA-averaged weights if available.
+    if swa_state is not None and swa_count > 0:
+        avg = {k: v / swa_count for k, v in swa_state.items()}
+        model.load_weights(list(avg.items()))
+        log(f"swa: loaded averaged weights from {swa_count} checkpoints")
 
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
