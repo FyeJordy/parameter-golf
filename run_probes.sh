@@ -12,6 +12,8 @@
 
 set -euo pipefail
 
+mkdir -p logs
+
 COMMON="DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
