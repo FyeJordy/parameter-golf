@@ -39,10 +39,10 @@ echo ""
 echo "=== All seeds complete ==="
 echo ""
 echo "Final metrics:"
-grep 'final_int8_zlib_roundtrip_exact' logs/full/full_s*.log
+grep 'final_export_roundtrip_exact' logs/full/full_s*.log
 echo ""
 echo "Submission sizes:"
-grep 'Total submission size int8' logs/full/full_s*.log
+grep 'Total submission size export' logs/full/full_s*.log
 echo ""
 echo "Run the significance check:"
 echo "python3 -c \""

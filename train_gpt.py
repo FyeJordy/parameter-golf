@@ -564,26 +564,29 @@ def quantize_float_tensor(t: Tensor, levels: float = 127.0) -> tuple[Tensor, Ten
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -levels, levels).to(torch.int8).contiguous()
     return q, scale
 
-def fake_quantize_per_row(w: Tensor, use_amax: bool = False) -> Tensor:
-    """Straight-through estimator fake quantization matching quantize_float_tensor().
-
-    Used during QAT to simulate int8 quantization in the forward pass so the
-    model learns to be robust to quantization noise.
-    """
+def fake_quantize_per_row(w: Tensor, use_amax: bool = False, levels: float = 127.0) -> Tensor:
+    """Straight-through estimator fake quantization matching quantize_float_tensor()."""
     with torch.no_grad():
         t32 = w.float()
-        if use_amax:
-            clip_abs = t32.abs().amax(dim=1)
-        else:
-            clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.zeros(t32.shape[0])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        # Round scale to float16 then back, matching actual quantize_float_tensor() pipeline.
+        clip_abs = t32.abs().amax(dim=1) if use_amax else (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.zeros(t32.shape[0])
+        )
+        scale = (clip_abs / levels).clamp_min(1.0 / levels)
         scale = scale.to(torch.float16).to(torch.float32)
         clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
-        w_q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127)
+        w_q = torch.clamp(torch.round(clipped / scale[:, None]), -levels, levels)
         w_deq = (w_q * scale[:, None]).to(w.dtype)
     return w + (w_deq - w).detach()
 
+def configure_qat_levels(module: nn.Module, export_mode: str) -> None:
+    qat_levels_map: dict[str, float] = {}
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, CastedLinear):
+            weight_name = f"{name}.weight" if name else "weight"
+            levels = export_tensor_spec(weight_name, export_mode).levels or 127.0
+            submodule._qat_levels = levels
+            qat_levels_map[weight_name] = levels
+    CastedLinear._qat_levels_map = qat_levels_map
 
 def quantize_state_dict_for_export(state_dict: dict[str, Tensor], export_mode: str):
     quantized: dict[str, Tensor] = {}
@@ -762,21 +765,27 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     _qat_active: bool = False  # Class-level flag toggled from the training loop.
     _qat_use_amax: bool = False
+    _qat_levels: float = 127.0
+    _qat_levels_map: dict[str, float] = {}
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if CastedLinear._qat_active and w.ndim == 2 and w.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
-            w = fake_quantize_per_row(w, use_amax=CastedLinear._qat_use_amax)
+            w = fake_quantize_per_row(w, use_amax=CastedLinear._qat_use_amax, levels=self._qat_levels)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+def build_token_param_groups(model: "GPT", token_lr: float) -> list[dict[str, object]]:
+    params = [model.tok_emb.weight]
+    if model.pair_hash is not None: params.append(model.pair_hash.embed.weight)
+    return [{"params": params, "lr": token_lr, "base_lr": token_lr, "weight_decay": 0.0}]
 
 
 class Rotary(nn.Module):
@@ -1132,16 +1141,11 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # Guard on CastedLinear._qat_active so torch.compile recompiles when QAT toggles.
+    configure_qat_levels(base_model, args.export_mode)
     torch._dynamo.config.guard_nn_modules = True
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     extra_named_params: list[tuple[str, Tensor]] = []
     if base_model.pair_hash is not None:
@@ -1162,15 +1166,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_params = [base_model.tok_emb.weight]
-    if base_model.pair_hash is not None:
-        token_params.append(base_model.pair_hash.embed.weight)
     optimizer_tok = torch.optim.Adam(
-        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
+        build_token_param_groups(base_model, token_lr),
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
-        weight_decay=args.weight_decay,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -1228,7 +1228,6 @@ def main() -> None:
         f"export_mode:{args.export_mode} use_zstd:{args.use_zstd}"
     )
 
-    # Set QAT amax fallback flag on the class.
     CastedLinear._qat_use_amax = args.qat_use_amax
 
     # SWA state — accumulates model weights during warmdown.

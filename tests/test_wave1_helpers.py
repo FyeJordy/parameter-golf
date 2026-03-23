@@ -1,5 +1,6 @@
 import math
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -58,6 +59,12 @@ class Wave1HelperTests(unittest.TestCase):
             restored = train_gpt.decompress_export_payload(blob, codec=codec)
             self.assertEqual(restored, payload)
 
+    def test_fake_quantize_per_row_respects_requested_levels(self):
+        w = torch.tensor([[0.10, 0.25, -0.33, 0.90]], dtype=torch.float32)
+        int8ish = train_gpt.fake_quantize_per_row(w, levels=127.0)
+        int5ish = train_gpt.fake_quantize_per_row(w, levels=train_gpt.INT5_MAX)
+        self.assertFalse(torch.allclose(int8ish, int5ish))
+
     def test_mixed_lowbit_quantize_roundtrip_preserves_tensor_shapes(self):
         state_dict = {
             "blocks.0.mlp.fc.weight": torch.randn(4, 4, dtype=torch.bfloat16),
@@ -95,6 +102,63 @@ class Wave1HelperTests(unittest.TestCase):
         attn_mask = train_gpt.build_eval_attn_mask(input_ids, bos_id=1, doc_isolated=True).to(dtype=torch.bfloat16)
         logits = model.forward_logits(input_ids, attn_mask=attn_mask)
         self.assertEqual(logits.shape, (1, 5, 32))
+
+    def test_configure_qat_levels_matches_export_tensor_spec(self):
+        model = train_gpt.GPT(
+            vocab_size=32,
+            num_layers=2,
+            model_dim=16,
+            num_heads=4,
+            num_kv_heads=2,
+            mlp_mult=2,
+            tie_embeddings=True,
+            tied_embed_init_std=0.02,
+            logit_softcap=30.0,
+            rope_base=10000.0,
+            qk_gain_init=1.0,
+            bos_id=1,
+            pairhash_enabled=True,
+            pairhash_buckets=128,
+            pairhash_dim=8,
+        )
+        train_gpt.configure_qat_levels(model, train_gpt.MIXED_LOWBITS_MODE)
+        self.assertEqual(model.blocks[0].mlp.fc._qat_levels, train_gpt.INT5_MAX)
+        self.assertEqual(model.blocks[0].attn.c_q._qat_levels, train_gpt.INT6_MAX)
+        self.assertEqual(model.pair_hash.proj._qat_levels, train_gpt.INT6_MAX)
+
+    def test_build_token_param_groups_disables_embedding_weight_decay(self):
+        model = train_gpt.GPT(
+            vocab_size=32,
+            num_layers=2,
+            model_dim=16,
+            num_heads=4,
+            num_kv_heads=2,
+            mlp_mult=2,
+            tie_embeddings=True,
+            tied_embed_init_std=0.02,
+            logit_softcap=30.0,
+            rope_base=10000.0,
+            qk_gain_init=1.0,
+            bos_id=1,
+            pairhash_enabled=True,
+            pairhash_buckets=128,
+            pairhash_dim=8,
+        )
+        groups = train_gpt.build_token_param_groups(model, token_lr=0.05)
+        self.assertEqual(groups[0]["weight_decay"], 0.0)
+        self.assertTrue(any(param is model.tok_emb.weight for param in groups[0]["params"]))
+        self.assertTrue(any(param is model.pair_hash.embed.weight for param in groups[0]["params"]))
+
+    def test_docs_and_validation_script_use_export_metric_names(self):
+        repo_root = Path(train_gpt.__file__).resolve().parent
+        run_full_validation = (repo_root / "run_full_validation.sh").read_text()
+        handoff = (repo_root / "HANDOFF.md").read_text()
+        self.assertIn("final_export_roundtrip_exact", run_full_validation)
+        self.assertIn("Total submission size export", run_full_validation)
+        self.assertIn("final_export_roundtrip_exact", handoff)
+        self.assertNotIn("final_int8_zlib_roundtrip_exact", run_full_validation)
+        self.assertNotIn("Total submission size int8", run_full_validation)
+        self.assertNotIn("final_int8_zlib_roundtrip_exact", handoff)
 
 
 if __name__ == "__main__":
