@@ -72,7 +72,7 @@ bash run_probes.sh 9   # Best combo × 3 seeds (variance check)
 **Key metric to check after each probe:**
 ```bash
 grep 'final_export_roundtrip_exact' logs/probe_*.log
-grep 'Total submission size int8' logs/probe_*.log
+grep 'Total submission size export' logs/probe_*.log
 ```
 
 ### Phase 4 — Full 8xH100 Validation (5 seeds, ~$60)
