@@ -112,7 +112,7 @@ class Hyperparameters:
     eval_seq_len: int = int(os.environ.get("EVAL_SEQ_LEN", 0))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64))
     eval_doc_isolated: bool = bool(int(os.environ.get("EVAL_DOC_ISOLATED", "1")))
-    export_mode: str = os.environ.get("EXPORT_MODE", "mixed_lowbit")
+    export_mode: str = os.environ.get("EXPORT_MODE", "int8")
     use_zstd: bool = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
@@ -467,7 +467,6 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT5_MAX = 15.0
 INT6_MAX = 31.0
 
-
 @dataclass(frozen=True)
 class ExportTensorSpec:
     mode: str
@@ -587,6 +586,14 @@ def configure_qat_levels(module: nn.Module, export_mode: str) -> None:
             submodule._qat_levels = levels
             qat_levels_map[weight_name] = levels
     CastedLinear._qat_levels_map = qat_levels_map
+
+def update_ema_state(ema_state: dict[str, Tensor] | None, current_state: dict[str, Tensor], decay: float) -> dict[str, Tensor]:
+    if ema_state is None:
+        return {name: tensor.detach().clone() for name, tensor in current_state.items()}
+    with torch.no_grad():
+        for name, tensor in current_state.items():
+            ema_state[name].lerp_(tensor.detach(), 1.0 - decay)
+    return ema_state
 
 def quantize_state_dict_for_export(state_dict: dict[str, Tensor], export_mode: str):
     quantized: dict[str, Tensor] = {}
@@ -1227,13 +1234,11 @@ def main() -> None:
         f"eval_stride:{args.eval_stride} eval_doc_isolated:{args.eval_doc_isolated} "
         f"export_mode:{args.export_mode} use_zstd:{args.use_zstd}"
     )
-
     CastedLinear._qat_use_amax = args.qat_use_amax
 
-    # SWA state — accumulates model weights during warmdown.
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()} if args.ema_enabled else None
+    ema_state: dict[str, Tensor] | None = None
     if args.ema_enabled and args.use_swa:
         log0("ema: enabled, ignoring USE_SWA=1 fallback")
 
@@ -1260,8 +1265,6 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
-    # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1364,10 +1367,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if ema_state is not None:
-            with torch.no_grad():
-                for name, tensor in base_model.state_dict().items():
-                    ema_state[name].lerp_(tensor.detach(), 1.0 - args.ema_decay)
+        if args.ema_enabled:
+            ema_state = update_ema_state(ema_state, base_model.state_dict(), args.ema_decay)
         zero_grad_all()
 
         # SWA: accumulate model weights during warmdown.

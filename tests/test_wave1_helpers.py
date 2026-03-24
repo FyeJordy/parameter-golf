@@ -65,6 +65,14 @@ class Wave1HelperTests(unittest.TestCase):
         int5ish = train_gpt.fake_quantize_per_row(w, levels=train_gpt.INT5_MAX)
         self.assertFalse(torch.allclose(int8ish, int5ish))
 
+    def test_update_ema_state_warm_starts_from_first_step(self):
+        base = {"w": torch.tensor([1.0, 2.0])}
+        ema = train_gpt.update_ema_state(None, base, decay=0.997)
+        self.assertTrue(torch.equal(ema["w"], base["w"]))
+        newer = {"w": torch.tensor([3.0, 6.0])}
+        ema = train_gpt.update_ema_state(ema, newer, decay=0.5)
+        self.assertTrue(torch.allclose(ema["w"], torch.tensor([2.0, 4.0])))
+
     def test_mixed_lowbit_quantize_roundtrip_preserves_tensor_shapes(self):
         state_dict = {
             "blocks.0.mlp.fc.weight": torch.randn(4, 4, dtype=torch.bfloat16),
@@ -159,6 +167,12 @@ class Wave1HelperTests(unittest.TestCase):
         self.assertNotIn("final_int8_zlib_roundtrip_exact", run_full_validation)
         self.assertNotIn("Total submission size int8", run_full_validation)
         self.assertNotIn("final_int8_zlib_roundtrip_exact", handoff)
+
+    def test_probe_ladder_uses_int8_zstd_for_wave1_path(self):
+        repo_root = Path(train_gpt.__file__).resolve().parent
+        run_probes = (repo_root / "run_probes.sh").read_text()
+        self.assertIn('EXPORT_MODE=int8 USE_ZSTD=1', run_probes)
+        self.assertNotIn('EXPORT_MODE=mixed_lowbit USE_ZSTD=1', run_probes)
 
 
 if __name__ == "__main__":
